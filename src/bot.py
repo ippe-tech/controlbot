@@ -71,7 +71,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.22"
+APP_VERSION = "2026.11.23"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -1580,7 +1580,11 @@ def get_file(path: str) -> tuple[bool, BytesIO | str, str | None]:
             return False, f"Это не файл: {path}", None
         
         # Check file size (Telegram limit is 50MB for bots)
-        size_mb = p.stat().st_size / (1024**2)
+        size_bytes = p.stat().st_size
+        if size_bytes == 0:
+            return False, f"Файл пустой (0 байт): {p.name}", None
+
+        size_mb = size_bytes / (1024**2)
         if size_mb > 50:
             return False, f"Файл слишком большой ({size_mb:.1f} МБ). Лимит Telegram для ботов: 50 МБ.", None
         
