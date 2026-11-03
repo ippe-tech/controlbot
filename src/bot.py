@@ -68,7 +68,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.12"
+APP_VERSION = "2026.11.13"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -3298,7 +3298,10 @@ def check_for_update() -> dict[str, Any] | None:
     else:
         try:
             url = f"{UPDATE_MANIFEST_URL}?t={int(time.time())}"
-            with urllib.request.urlopen(url, timeout=20) as response:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "ControlBot-updater/1.0"}
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
                 data = json.loads(response.read().decode("utf-8", "replace"))
         except Exception as exc:  # noqa: BLE001
             LOGGER.info("Проверка обновлений недоступна: %s", exc)
