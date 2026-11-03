@@ -68,12 +68,12 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.09"
+APP_VERSION = "2026.11.10"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
-UPDATE_SOURCE = os.getenv("UPDATE_SOURCE", "").strip().lower()
-UPDATE_REPO = os.getenv("UPDATE_REPO", "").strip()
+UPDATE_SOURCE = os.getenv("UPDATE_SOURCE", "github").strip().lower()
+UPDATE_REPO = os.getenv("UPDATE_REPO", "ippe-tech/controlbot").strip()
 UPDATE_TOKEN = os.getenv("UPDATE_TOKEN", "").strip()
 
 
