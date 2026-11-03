@@ -70,7 +70,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.18"
+APP_VERSION = "2026.11.19"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -3332,14 +3332,17 @@ def check_for_update() -> dict[str, Any] | None:
 
 
 def download_and_apply_update(manifest: dict[str, Any]) -> bool:
-    """Скачать новый exe и перезапустить программу через bat-обновлятор."""
-    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+    """Скачать новую версию ОТДЕЛЬНЫМ файлом и запустить её.
+
+    Работающий exe не трогаем: кладём рядом ControlBot-<версия>.exe,
+    переключаем автозапуск на него и стартуем. Старый файл остаётся
+    как запасной — ничего не удаляется и не перезаписывается.
+    """
+    if sys.platform != "win32":
         return False
 
-    current = Path(sys.executable).resolve()
-    temp_dir = Path(tempfile.gettempdir())
-    staged = temp_dir / "ControlBot-new.exe"
-    updater = temp_dir / "controlbot_update.bat"
+    version = str(manifest.get("version") or "").strip() or "new"
+    target = APP_DIR / f"ControlBot-{version}.exe"
 
     try:
         with urllib.request.urlopen(str(manifest["url"]), timeout=180) as response:
@@ -3354,75 +3357,25 @@ def download_and_apply_update(manifest: dict[str, Any]) -> bool:
         return False
 
     try:
-        staged.write_bytes(payload)
+        target.write_bytes(payload)
     except OSError as exc:
-        LOGGER.warning("Не удалось сохранить обновление: %s", exc)
+        LOGGER.warning("Не удалось сохранить %s: %s", target.name, exc)
         return False
 
-    if staged.stat().st_size != len(payload):
-        LOGGER.warning("Размер сохранённого файла не совпал - обновление отменено.")
+    if target.stat().st_size != len(payload):
+        LOGGER.warning("Размер сохранённого файла не совпал — обновление отменено.")
         return False
 
-    backup = current.with_suffix(".exe.bak")
-    log_path = temp_dir / "controlbot_update.log"
-    lines = [
-        "@echo off",
-        "setlocal",
-        f'set "LOG={log_path}"',
-        f'set "EXE={current}"',
-        f'set "NEW={staged}"',
-        f'set "BAK={backup}"',
-        'echo [%date% %time%] update start >> "%LOG%"',
-        "timeout /t 6 /nobreak >nul",
-        ":wait",
-        'tasklist /FI "IMAGENAME eq ControlBot.exe" 2>nul | find /I "ControlBot.exe" >nul',
-        "if not errorlevel 1 (",
-        "  timeout /t 2 /nobreak >nul",
-        "  goto wait",
-        ")",
-        'echo [%date% %time%] old process stopped >> "%LOG%"',
-        'if exist "%EXE%" copy /y "%EXE%" "%BAK%" >nul 2>&1',
-        'copy /y "%NEW%" "%EXE%.new" >nul 2>&1',
-        'if not exist "%EXE%.new" (',
-        '  echo [%date% %time%] COPY FAILED >> "%LOG%"',
-        '  goto rollback',
-        ")",
-        'move /y "%EXE%.new" "%EXE%" >nul 2>&1',
-        'if not exist "%EXE%" (',
-        '  echo [%date% %time%] REPLACE FAILED >> "%LOG%"',
-        "  goto rollback",
-        ")",
-        'echo [%date% %time%] replaced, starting >> "%LOG%"',
-        'start "" "%EXE%"',
-        'timeout /t 5 /nobreak >nul',
-        'tasklist /FI "IMAGENAME eq ControlBot.exe" 2>nul | find /I "ControlBot.exe" >nul',
-        "if errorlevel 1 (",
-        '  echo [%date% %time%] START FAILED >> "%LOG%"',
-        "  goto rollback",
-        ")",
-        'echo [%date% %time%] OK >> "%LOG%"',
-        'del "%NEW%" >nul 2>&1',
-        'del "%~f0"',
-        "exit /b 0",
-        ":rollback",
-        'if exist "%BAK%" copy /y "%BAK%" "%EXE%" >nul 2>&1',
-        'echo [%date% %time%] rolled back >> "%LOG%"',
-        'if exist "%EXE%" start "" "%EXE%"',
-        'del "%~f0"',
-        "exit /b 1",
-    ]
-    updater.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    ok, detail = _install_autostart(target)
+    LOGGER.info("Автозапуск переключён на %s: %s (%s)", target.name, ok, detail)
 
-    creationflags = 0
-    if hasattr(subprocess, "DETACHED_PROCESS"):
-        creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     try:
-        subprocess.Popen(["cmd", "/c", str(updater)], creationflags=creationflags, close_fds=True)
+        subprocess.Popen([str(target)], cwd=str(APP_DIR), close_fds=True)
     except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Не удалось запустить обновлятор: %s", exc)
+        LOGGER.warning("Не удалось запустить %s: %s", target.name, exc)
         return False
 
-    LOGGER.info("Обновление до %s скачано, перезапускаюсь.", manifest.get("version"))
+    LOGGER.info("Версия %s запущена отдельным файлом, старая остаётся.", version)
     return True
 
 
@@ -3813,13 +3766,13 @@ def _upsert_env(values: dict[str, str]) -> Path:
     return path
 
 
-def _install_autostart() -> tuple[bool, str]:
+def _install_autostart(target_exe: Path | None = None) -> tuple[bool, str]:
     """Ярлык в автозагрузке: на exe или на pythonw + bot.py."""
     if sys.platform != "win32":
         return False, "автозапуск настраивается только в Windows"
 
     if getattr(sys, "frozen", False):
-        target = str(Path(sys.executable).resolve())
+        target = str((target_exe or Path(sys.executable)).resolve())
         arguments = ""
     else:
         pythonw = Path(sys.executable).with_name("pythonw.exe")
