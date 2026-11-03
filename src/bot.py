@@ -70,7 +70,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.17"
+APP_VERSION = "2026.11.18"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -1841,6 +1841,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     place = " / ".join(part for part in (config.club_name, config.pc_name) if part)
     lines = [f"📊 <b>Состояние системы</b>{(' — ' + place) if place else ''}\n"]
     lines.append(f"🤖 <b>Версия:</b> {APP_VERSION}")
+    lines.append(f"🔄 <b>Обновления:</b> GitHub ({UPDATE_REPO})")
     
     # CPU
     cpu_emoji = "🟢" if status["cpu_percent"] < 70 else "🟡" if status["cpu_percent"] < 90 else "🔴"
