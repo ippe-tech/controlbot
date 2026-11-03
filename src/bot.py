@@ -70,7 +70,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.16"
+APP_VERSION = "2026.11.17"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -3358,19 +3358,57 @@ def download_and_apply_update(manifest: dict[str, Any]) -> bool:
         LOGGER.warning("Не удалось сохранить обновление: %s", exc)
         return False
 
+    if staged.stat().st_size != len(payload):
+        LOGGER.warning("Размер сохранённого файла не совпал - обновление отменено.")
+        return False
+
+    backup = current.with_suffix(".exe.bak")
+    log_path = temp_dir / "controlbot_update.log"
     lines = [
         "@echo off",
         "setlocal",
-        "timeout /t 4 /nobreak >nul",
+        f'set "LOG={log_path}"',
+        f'set "EXE={current}"',
+        f'set "NEW={staged}"',
+        f'set "BAK={backup}"',
+        'echo [%date% %time%] update start >> "%LOG%"',
+        "timeout /t 6 /nobreak >nul",
         ":wait",
         'tasklist /FI "IMAGENAME eq ControlBot.exe" 2>nul | find /I "ControlBot.exe" >nul',
         "if not errorlevel 1 (",
         "  timeout /t 2 /nobreak >nul",
         "  goto wait",
         ")",
-        f'copy /y "{staged}" "{current}" >nul',
-        f'start "" "{current}"',
+        'echo [%date% %time%] old process stopped >> "%LOG%"',
+        'if exist "%EXE%" copy /y "%EXE%" "%BAK%" >nul 2>&1',
+        'copy /y "%NEW%" "%EXE%.new" >nul 2>&1',
+        'if not exist "%EXE%.new" (',
+        '  echo [%date% %time%] COPY FAILED >> "%LOG%"',
+        '  goto rollback',
+        ")",
+        'move /y "%EXE%.new" "%EXE%" >nul 2>&1',
+        'if not exist "%EXE%" (',
+        '  echo [%date% %time%] REPLACE FAILED >> "%LOG%"',
+        "  goto rollback",
+        ")",
+        'echo [%date% %time%] replaced, starting >> "%LOG%"',
+        'start "" "%EXE%"',
+        'timeout /t 5 /nobreak >nul',
+        'tasklist /FI "IMAGENAME eq ControlBot.exe" 2>nul | find /I "ControlBot.exe" >nul',
+        "if errorlevel 1 (",
+        '  echo [%date% %time%] START FAILED >> "%LOG%"',
+        "  goto rollback",
+        ")",
+        'echo [%date% %time%] OK >> "%LOG%"',
+        'del "%NEW%" >nul 2>&1',
         'del "%~f0"',
+        "exit /b 0",
+        ":rollback",
+        'if exist "%BAK%" copy /y "%BAK%" "%EXE%" >nul 2>&1',
+        'echo [%date% %time%] rolled back >> "%LOG%"',
+        'if exist "%EXE%" start "" "%EXE%"',
+        'del "%~f0"',
+        "exit /b 1",
     ]
     updater.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
 
