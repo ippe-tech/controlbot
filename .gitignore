@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+bot.log
+helper24_sync.log
+activity_data.json
+controlbot_instance.lock
+release/
+build/tmp/
+.venv-build/
+
+src/build_secrets.py

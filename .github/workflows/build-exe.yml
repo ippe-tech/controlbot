@@ -1,0 +1,51 @@
+name: Build ControlBot.exe
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Секреты сборки
+        shell: bash
+        env:
+          HELPER24_FERNET_KEY: ${{ secrets.HELPER24_FERNET_KEY }}
+          HELPER24_NTFY_URL: ${{ secrets.HELPER24_NTFY_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          data = {
+              "HELPER24_FERNET_KEY": os.environ.get("HELPER24_FERNET_KEY", ""),
+              "HELPER24_NTFY_URL": os.environ.get("HELPER24_NTFY_URL", ""),
+          }
+          open("src/build_secrets.py", "w", encoding="utf-8").write("SECRETS = " + repr(data) + "\n")
+          PY
+
+      - name: Сборка exe
+        run: pyinstaller --noconfirm --clean --distpath release --workpath build\tmp build\controlbot.spec
+
+      - name: Проверка файла
+        run: dir release
+
+      - name: Релиз
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/ControlBot.exe
+          generate_release_notes: true
