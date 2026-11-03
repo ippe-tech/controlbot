@@ -69,7 +69,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.14"
+APP_VERSION = "2026.11.15"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -1785,6 +1785,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 /logout - выйти из системы
 /reboot - перезагрузить ПК
 /shutdown - выключить ПК
+
+<b>👥 Доступ к боту:</b>
+/access - кто имеет доступ и заявки
+/grant &lt;ID&gt; - выдать доступ
+/revoke &lt;ID&gt; - отозвать доступ
+
+<b>🤖 Служебное:</b>
+/report - отправить отчёт Helper24 сейчас
+/update - проверить и установить обновление
 
 """
     await update.effective_message.reply_text(
