@@ -28,6 +28,7 @@ hidden = list(telegram_hidden) + [
     "activity_tracker",
     "browser_sites",
     "setup_gui",
+    "access_store",
     "tkinter",
     "tkinter.ttk",
     "tkinter.messagebox",

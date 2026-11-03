@@ -61,13 +61,14 @@ except ImportError:
     HAS_CV2 = False
 
 from activity_tracker import ActivityTracker
+import access_store
 
 try:
     import helper24_report
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.08"
+APP_VERSION = "2026.11.09"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -359,6 +360,9 @@ def is_authorized(update: Update, config: BotConfig) -> bool:
     chat = update.effective_chat
     if not chat or chat.type != "private":
         return False
+    store = access_store.get_store()
+    if store is not None and store.is_allowed(chat.id):
+        return True
     if chat.id in config.allowed_chat_ids:
         return True
     return config.allowed_chat_id is not None and chat.id == config.allowed_chat_id
@@ -379,7 +383,157 @@ async def send_setup_message(update: Update) -> None:
 
 
 async def send_unauthorized_message(update: Update) -> None:
-    await update.effective_message.reply_text("⛔ Доступ запрещен.")
+    user = update.effective_user
+    store = access_store.get_store()
+    if user is None or store is None or store.is_allowed(user.id):
+        await update.effective_message.reply_text("⛔ Доступ запрещен.")
+        return
+
+    if store.is_pending(user.id):
+        await update.effective_message.reply_text(
+            "⛔ Доступ запрещён.\n📨 Заявка уже отправлена владельцу — ожидайте решения."
+        )
+        return
+
+    store.add_pending(user.id, user.username or "", user.full_name or "")
+    await update.effective_message.reply_text(
+        "⛔ Доступ запрещён.\n📨 Заявка отправлена владельцу — ожидайте решения."
+    )
+
+    owner = store.owner_id
+    if not owner:
+        return
+    who = user.full_name or str(user.id)
+    if user.username:
+        who += f" (@{user.username})"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Выдать доступ", callback_data=f"access:ok:{user.id}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"access:no:{user.id}"),
+            ]
+        ]
+    )
+    try:
+        await update.get_bot().send_message(
+            owner,
+            f"🆕 <b>Запрос доступа к ControlBot</b>\n\n👤 {escape(who)}\n🆔 <code>{user.id}</code>",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Не удалось отправить заявку владельцу: %s", exc)
+
+
+async def access_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Список тех, кому разрешён доступ."""
+    config = get_config(context)
+    if not is_authorized(update, config):
+        await send_unauthorized_message(update)
+        return
+
+    store = access_store.get_store()
+    if store is None:
+        await update.effective_message.reply_text("Хранилище доступов не инициализировано.")
+        return
+
+    lines = ["👥 <b>Доступ к боту</b>", ""]
+    for user_id, info in store.allowed_items():
+        mark = "👑" if store.is_owner(user_id) else "✅"
+        name = info.get("name") or "без имени"
+        uname = f" (@{info['username']})" if info.get("username") else ""
+        lines.append(f"{mark} {escape(name)}{escape(uname)} — <code>{user_id}</code>")
+
+    pending = store.pending_items()
+    if pending:
+        lines.append("")
+        lines.append("🕐 <b>Заявки:</b>")
+        for user_id, info in pending:
+            name = info.get("name") or "без имени"
+            lines.append(f"🆕 {escape(name)} — <code>{user_id}</code>")
+
+    lines.append("")
+    lines.append("Выдать: <code>/grant ID</code> · отозвать: <code>/revoke ID</code>")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def grant_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Выдать доступ по ID: /grant 123456789."""
+    config = get_config(context)
+    user = update.effective_user
+    store = access_store.get_store()
+    if store is None or user is None or not store.is_owner(user.id):
+        await update.effective_message.reply_text("⛔ Только владелец бота.")
+        return
+
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.effective_message.reply_text("Использование: /grant 123456789")
+        return
+
+    target = int(args[0])
+    if store.grant(target, by=user.id):
+        await update.effective_message.reply_text(f"✅ Доступ выдан: {target}")
+        try:
+            await context.bot.send_message(target, "✅ Вам выдали доступ к ControlBot. Отправьте /start.")
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        await update.effective_message.reply_text(f"ℹ️ У {target} уже есть доступ.")
+
+
+async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отозвать доступ: /revoke 123456789."""
+    user = update.effective_user
+    store = access_store.get_store()
+    if store is None or user is None or not store.is_owner(user.id):
+        await update.effective_message.reply_text("⛔ Только владелец бота.")
+        return
+
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.effective_message.reply_text("Использование: /revoke 123456789")
+        return
+
+    target = int(args[0])
+    if store.revoke(target):
+        await update.effective_message.reply_text(f"🚫 Доступ отозван: {target}")
+    else:
+        await update.effective_message.reply_text(
+            f"❓ Нельзя отозвать: нет доступа или это владелец ({target})."
+        )
+
+
+async def access_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки ✅/❌ в заявке владельцу."""
+    query = update.callback_query
+    user = update.effective_user
+    store = access_store.get_store()
+    if query is None or user is None or store is None or not store.is_owner(user.id):
+        if query is not None:
+            await query.answer("Только владелец бота.", show_alert=True)
+        return
+
+    parts = (query.data or "").split(":")
+    if len(parts) < 3 or not parts[2].isdigit():
+        await query.answer()
+        return
+
+    action, target = parts[1], int(parts[2])
+    await query.answer()
+
+    if action == "ok":
+        store.grant(target, by=user.id)
+        await query.edit_message_text(f"✅ Доступ выдан: {target}")
+        try:
+            await context.bot.send_message(
+                target, "✅ Вам выдали доступ к ControlBot. Отправьте /start."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        store.reject(target)
+        await query.edit_message_text(f"❌ Заявка отклонена: {target}")
 
 
 def build_power_action_markup(callback_data: str, button_text: str) -> InlineKeyboardMarkup:
@@ -3288,6 +3442,9 @@ def build_application(config: BotConfig) -> Application:
     application.bot_data["scheduled_tasks"] = []
     application.add_error_handler(error_handler)
 
+    owner_id = next(iter(config.allowed_chat_ids), config.allowed_chat_id)
+    access_store.init_store(APP_DIR / "access_users.json", owner_id)
+
     tracker = ActivityTracker(
         data_path=APP_DIR / "activity_data.json",
         afk_threshold_seconds=config.activity_afk_seconds,
@@ -3330,6 +3487,10 @@ def build_application(config: BotConfig) -> Application:
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("ping_me", report_command))
     application.add_handler(CommandHandler("update", update_command))
+    application.add_handler(CommandHandler("access", access_command))
+    application.add_handler(CommandHandler("grant", grant_command))
+    application.add_handler(CommandHandler("revoke", revoke_command))
+    application.add_handler(CallbackQueryHandler(access_callback, pattern=r"^access:"))
     application.add_handler(CommandHandler("services", services_command))
     
     # Brightness & Volume
