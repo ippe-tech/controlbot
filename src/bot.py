@@ -71,7 +71,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.25"
+APP_VERSION = "2026.11.26"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -2592,27 +2592,53 @@ async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     try:
-        image = Image.open(result).convert("RGB")
-        image.thumbnail((1600, 1600))
-        buffer = BytesIO()
-        image.save(buffer, format="JPEG", quality=75, optimize=True)
-        buffer.seek(0)
-    except Exception:  # noqa: BLE001
-        buffer = result
-
-    try:
         await status.delete()
     except Exception:  # noqa: BLE001
         pass
 
+    # 1) Оригинал PNG — максимальное качество
     try:
         await update.effective_message.reply_photo(
-            photo=buffer, caption="📸 Скриншот готов.", read_timeout=120, write_timeout=120,
+            photo=result,
+            caption="📸 Скриншот готов.",
+            read_timeout=180,
+            write_timeout=180,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Оригинал скриншота не ушёл (%s), пробую сжатый.", exc)
+
+    # 2) Запасной вариант: сжатый JPEG (если оригинал не прошёл по размеру/таймауту)
+    try:
+        result.seek(0)
+        image = Image.open(result).convert("RGB")
+        image.thumbnail((1920, 1920))
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=88, optimize=True)
+        buffer.seek(0)
+        await update.effective_message.reply_photo(
+            photo=buffer,
+            caption="📸 Скриншот (сжатый — оригинал не прошёл по размеру).",
+            read_timeout=180,
+            write_timeout=180,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Сжатый скриншот тоже не ушёл: %s", exc)
+
+    # 3) Последняя попытка — файлом
+    try:
+        result.seek(0)
+        await update.effective_message.reply_document(
+            document=result,
+            filename="screenshot.png",
+            caption="📸 Скриншот (файлом, без сжатия).",
+            read_timeout=180,
+            write_timeout=180,
         )
     except Exception as exc:  # noqa: BLE001
         await update.effective_message.reply_text(
-            f"⚠️ Не удалось отправить скриншот: {type(exc).__name__}. "
-            "Файл большой или медленная связь — попробуйте ещё раз."
+            f"⚠️ Не удалось отправить скриншот: {type(exc).__name__}."
         )
 
 
