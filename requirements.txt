@@ -5,3 +5,4 @@ pyperclip>=1.8
 # Необязательно: фото с веб-камеры (/webcam). По умолчанию выключено.
 # opencv-python>=4.8
 cryptography>=41
+certifi>=2024.2.2

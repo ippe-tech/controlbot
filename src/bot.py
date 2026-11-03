@@ -71,7 +71,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.23"
+APP_VERSION = "2026.11.24"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -2584,14 +2584,33 @@ async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     status = await update.effective_message.reply_text("📷 Делаю скриншот...")
     
     success, result = take_screenshot()
-    if success:
-        await status.delete()
-        await update.effective_message.reply_photo(
-            photo=result,
-            caption="📸 Скриншот готов.",
-        )
-    else:
+    if not success:
         await status.edit_text(f"❌ Не удалось сделать скриншот.\n{result}")
+        return
+
+    try:
+        image = Image.open(result).convert("RGB")
+        image.thumbnail((1600, 1600))
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=75, optimize=True)
+        buffer.seek(0)
+    except Exception:  # noqa: BLE001
+        buffer = result
+
+    try:
+        await status.delete()
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        await update.effective_message.reply_photo(
+            photo=buffer, caption="📸 Скриншот готов.", read_timeout=120, write_timeout=120,
+        )
+    except Exception as exc:  # noqa: BLE001
+        await update.effective_message.reply_text(
+            f"⚠️ Не удалось отправить скриншот: {type(exc).__name__}. "
+            "Файл большой или медленная связь — попробуйте ещё раз."
+        )
 
 
 async def webcam_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2929,8 +2948,24 @@ async def sites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def activity_tick_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     tracker = _get_activity_tracker(context)
-    if tracker is not None:
-        await tracker.tick()
+    if tracker is None:
+        return
+    await tracker.tick()
+
+    ticks = int(context.application.bot_data.get("activity_ticks", 0)) + 1
+    context.application.bot_data["activity_ticks"] = ticks
+    if ticks % 20 == 0:
+        try:
+            snap = await tracker.snapshot_now()
+            LOGGER.info(
+                "activity diag: exe=%s idle=%.0f afk=%s windows=%s",
+                snap.get("exe"),
+                float(snap.get("idle") or 0),
+                snap.get("afk"),
+                len(snap.get("visible") or []),
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("activity diag failed: %s", exc)
 
 
 async def activity_summary_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3246,6 +3281,18 @@ async def helper24_digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         LOGGER.warning("Отчёт Helper24 не отправлен: %s", exc)
 
 
+def _ssl_context():
+    """CA-сертификаты: в exe системного хранилища может не хватать."""
+    try:
+        import ssl
+
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _version_tuple(value: str) -> tuple[int, ...]:
     parts: list[int] = []
     for chunk in re.split(r"[.\-+_]", str(value or "").lstrip("vV")):
@@ -3269,7 +3316,9 @@ def _github_release() -> dict[str, Any] | None:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(
+            request, timeout=20, context=_ssl_context()
+        ) as response:
             data = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         LOGGER.info("GitHub вернул %s при проверке релиза %s", exc.code, repo)
@@ -3320,7 +3369,9 @@ def check_for_update() -> dict[str, Any] | None:
             request = urllib.request.Request(
                 url, headers={"User-Agent": "ControlBot-updater/1.0"}
             )
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(
+                request, timeout=20, context=_ssl_context()
+            ) as response:
                 data = json.loads(response.read().decode("utf-8", "replace"))
         except Exception as exc:  # noqa: BLE001
             LOGGER.info("Проверка обновлений недоступна: %s", exc)
