@@ -30,7 +30,7 @@ def _now() -> str:
 class AccessStore:
     def __init__(self, path: Path, owner_id: int | None) -> None:
         self.path = path
-        self.data: dict[str, Any] = {"owner": owner_id, "allowed": {}, "pending": {}}
+        self.data: dict[str, Any] = {"owner": owner_id, "admins": [], "allowed": {}, "pending": {}, "revoked": {}}
         self._load()
         if owner_id:
             self.data["owner"] = int(owner_id)
@@ -55,8 +55,10 @@ class AccessStore:
         if isinstance(raw, dict):
             self.data = {
                 "owner": raw.get("owner"),
+                "admins": [int(x) for x in (raw.get("admins") or []) if str(x).lstrip("-").isdigit()],
                 "allowed": {str(k): v for k, v in (raw.get("allowed") or {}).items()},
                 "pending": {str(k): v for k, v in (raw.get("pending") or {}).items()},
+                "revoked": {str(k): v for k, v in (raw.get("revoked") or {}).items()},
             }
 
     def _save(self) -> None:
@@ -77,12 +79,44 @@ class AccessStore:
     def is_owner(self, user_id: int | None) -> bool:
         return user_id is not None and user_id == self.owner_id
 
+    def is_admin(self, user_id: int | None) -> bool:
+        if user_id is None:
+            return False
+        return self.is_owner(user_id) or int(user_id) in self.data.get("admins", [])
+
     def is_allowed(self, user_id: int | None) -> bool:
         if user_id is None:
             return False
-        if self.is_owner(user_id):
+        if self.is_admin(user_id):
             return True
         return str(user_id) in self.data["allowed"]
+
+    def make_admin(self, user_id: int) -> bool:
+        if self.is_owner(user_id):
+            return False
+        if not self.is_allowed(user_id):
+            self.grant(user_id)
+        if user_id not in self.data.setdefault("admins", []):
+            self.data["admins"].append(user_id)
+            self._save()
+            return True
+        return False
+
+    def demote_admin(self, user_id: int) -> bool:
+        admins = self.data.setdefault("admins", [])
+        if user_id in admins and not self.is_owner(user_id):
+            admins.remove(user_id)
+            self._save()
+            return True
+        return False
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "admins": len(self.data.get("admins", [])),
+            "allowed": len(self.data.get("allowed", {})),
+            "pending": len(self.data.get("pending", {})),
+            "revoked": len(self.data.get("revoked", {})),
+        }
 
     def is_pending(self, user_id: int) -> bool:
         return str(user_id) in self.data["pending"]
@@ -113,7 +147,10 @@ class AccessStore:
         key = str(user_id)
         if self.is_owner(user_id) or key not in self.data["allowed"]:
             return False
-        del self.data["allowed"][key]
+        info = self.data["allowed"].pop(key)
+        self.data.setdefault("revoked", {})[key] = {**info, "revoked_at": _now()}
+        if user_id in self.data.get("admins", []):
+            self.data["admins"].remove(user_id)
         self._save()
         return True
 

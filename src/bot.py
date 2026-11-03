@@ -63,13 +63,14 @@ except ImportError:
 
 from activity_tracker import ActivityTracker
 import access_store
+import admin_panel
 
 try:
     import helper24_report
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.15"
+APP_VERSION = "2026.11.16"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -1787,6 +1788,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 /shutdown - выключить ПК
 
 <b>👥 Доступ к боту:</b>
+/admin - панель управления доступом
 /access - кто имеет доступ и заявки
 /grant &lt;ID&gt; - выдать доступ
 /revoke &lt;ID&gt; - отозвать доступ
@@ -3532,6 +3534,7 @@ def build_application(config: BotConfig) -> Application:
     application.add_handler(CommandHandler("grant", grant_command))
     application.add_handler(CommandHandler("revoke", revoke_command))
     application.add_handler(CallbackQueryHandler(access_callback, pattern=r"^access:"))
+    admin_panel.register(application)
     application.add_handler(CommandHandler("services", services_command))
     
     # Brightness & Volume
