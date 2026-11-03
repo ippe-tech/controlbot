@@ -70,7 +70,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.19"
+APP_VERSION = "2026.11.20"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -3458,7 +3458,7 @@ async def post_init(application: Application) -> None:
     ]
     try:
         await application.bot.set_my_commands(
-            [BotCommand(name=name, description=desc) for name, desc in commands]
+            [BotCommand(name, desc) for name, desc in commands]
         )
         LOGGER.info("Меню команд обновлено: %s команд", len(commands))
     except Exception as exc:  # noqa: BLE001
