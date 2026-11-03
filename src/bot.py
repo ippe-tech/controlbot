@@ -71,7 +71,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.26"
+APP_VERSION = "2026.11.27"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -3431,7 +3431,9 @@ def download_and_apply_update(manifest: dict[str, Any]) -> bool:
     target = APP_DIR / f"ControlBot-{version}.exe"
 
     try:
-        with urllib.request.urlopen(str(manifest["url"]), timeout=180) as response:
+        with urllib.request.urlopen(
+            str(manifest["url"]), timeout=180, context=_ssl_context()
+        ) as response:
             payload = response.read()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Не удалось скачать обновление: %s", exc)
