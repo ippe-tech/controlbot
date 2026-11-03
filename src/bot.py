@@ -34,6 +34,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
@@ -70,7 +71,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.21"
+APP_VERSION = "2026.11.22"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -3466,6 +3467,123 @@ async def post_init(application: Application) -> None:
         LOGGER.warning("Не удалось обновить меню команд: %s", exc)
 
 
+# =============================================================================
+# ТЕРМИНАЛ
+# =============================================================================
+
+TERM_MAX_CHARS = 3500
+
+
+def _term_sessions(application) -> dict:
+    return application.bot_data.setdefault("terminals", {})
+
+
+def _decode_console(raw: bytes) -> str:
+    for enc in ("utf-8", "cp866", "cp1251"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _run_shell(command: str, cwd: str, timeout: int = 180) -> tuple[int, str]:
+    completed = subprocess.run(
+        ["cmd", "/c", command],
+        cwd=cwd,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    return completed.returncode, _decode_console(completed.stdout + completed.stderr)
+
+
+async def term_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Открыть терминал: дальше каждое сообщение — команда Windows."""
+    config = get_config(context)
+    if not is_authorized(update, config):
+        await send_unauthorized_message(update)
+        return
+
+    chat = update.effective_chat
+    sessions = _term_sessions(context.application)
+    sessions[chat.id] = {"cwd": str(APP_DIR)}
+
+    await update.effective_message.reply_text(
+        "🖥 <b>Терминал открыт</b>\n"
+        f"Папка: <code>{APP_DIR}</code>\n\n"
+        "Просто отправляйте команды — выполню и верну вывод.\n"
+        "<code>cd ..</code> — сменить папку, <code>/exit</code> — закрыть.",
+        parse_mode="HTML",
+    )
+
+
+async def term_exit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    sessions = _term_sessions(context.application)
+    if sessions.pop(chat.id, None) is not None:
+        await update.effective_message.reply_text("🖥 Терминал закрыт.")
+    else:
+        await update.effective_message.reply_text("Терминал и так закрыт. Открыть: /term")
+
+
+async def terminal_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Выполнить команду, если для чата открыт терминал."""
+    chat = update.effective_chat
+    message = update.effective_message
+    sessions = _term_sessions(context.application)
+    if chat is None or message is None or chat.id not in sessions:
+        return
+
+    command = (message.text or "").strip()
+    if not command:
+        return
+
+    state = sessions[chat.id]
+    cwd = state.get("cwd") or str(APP_DIR)
+
+    if command.lower() in ("exit", "quit", "выход"):
+        sessions.pop(chat.id, None)
+        await message.reply_text("🖥 Терминал закрыт.")
+        raise ApplicationHandlerStop
+
+    if command.lower().startswith("cd "):
+        target = command[3:].strip().strip('"')
+        new_path = (Path(cwd) / target).resolve() if not Path(target).is_absolute() else Path(target)
+        if new_path.is_dir():
+            state["cwd"] = str(new_path)
+            await message.reply_text(f"📁 <code>{new_path}</code>", parse_mode="HTML")
+        else:
+            await message.reply_text(f"❌ Папка не найдена: <code>{new_path}</code>", parse_mode="HTML")
+        raise ApplicationHandlerStop
+
+    try:
+        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        code, output = await asyncio.to_thread(_run_shell, command, cwd)
+    except subprocess.TimeoutExpired:
+        await message.reply_text("⏱ Команда не завершилась за 3 минуты — прервана.")
+        return
+    except Exception as exc:  # noqa: BLE001
+        await message.reply_text(f"❌ Ошибка запуска: {exc}")
+        return
+
+    text = output.strip() or "(пусто)"
+    chunks = [text[i:i + TERM_MAX_CHARS] for i in range(0, len(text), TERM_MAX_CHARS)] or [""]
+    for index, chunk in enumerate(chunks[:6]):
+        prefix = "" if index == 0 else "… "
+        await message.reply_text(
+            f"{prefix}<pre>{escape(chunk)}</pre>",
+            parse_mode="HTML",
+        )
+    if len(chunks) > 6:
+        await message.reply_text("… вывод обрезан")
+    await message.reply_text(f"↩️ Код выхода: {code}")
+    raise ApplicationHandlerStop
+
+
 def build_application(config: BotConfig) -> Application:
     application = (
         ApplicationBuilder()
@@ -3520,6 +3638,8 @@ def build_application(config: BotConfig) -> Application:
     application.add_handler(CommandHandler("processes_all", processes_all_command))
     application.add_handler(CommandHandler("kill", kill_process_command))
     application.add_handler(CommandHandler("network", network_command))
+    application.add_handler(CommandHandler(["term", "terminal"], term_command))
+    application.add_handler(CommandHandler(["exit", "close"], term_exit_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("ping_me", report_command))
     application.add_handler(CommandHandler("update", update_command))
@@ -3603,6 +3723,11 @@ def build_application(config: BotConfig) -> Application:
             )
         )
     
+    # Терминал (до fallback): текст в открытом терминале — это команда
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, terminal_message), group=-2
+    )
+
     # Fallback
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text_handler)
