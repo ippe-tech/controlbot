@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import time as dt_time
+from datetime import date, time as dt_time, timedelta
 from html import escape
 from io import BytesIO
 from logging.handlers import RotatingFileHandler
@@ -71,7 +71,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.27"
+APP_VERSION = "2026.11.28"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -1781,6 +1781,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
  /apps - что открыто сейчас
  /topapps [today|7d|30d] - топ приложений по времени
  /activity [ГГГГ-ММ-ДД] - отчёт за день
+ /log [дата|все] - журнал: когда и что открывалось
  /sites [today|7d|30d] - сайты из истории браузеров
 
 <b>⏰ Расписание:</b>
@@ -3538,6 +3539,7 @@ async def post_init(application: Application) -> None:
         ("report", "Отправить отчёт Helper24"),
         ("update", "Проверить обновление"),
         ("notify", "Уведомления о состоянии ПК"),
+        ("log", "Журнал активности"),
         ("screenshot", "Скриншот экрана"),
         ("apps", "Что открыто сейчас"),
         ("activity", "Сводка активности"),
@@ -3748,6 +3750,74 @@ async def notify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pass
 
 
+def _split_text(text: str, limit: int = 3800) -> list[str]:
+    parts: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            if current:
+                parts.append(current)
+            while len(line) > limit:
+                parts.append(line[:limit])
+                line = line[limit:]
+            current = line
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts or [text]
+
+
+async def log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Журнал активности: /log [дата|все]."""
+    config = get_config(context)
+    if not is_authorized(update, config):
+        await send_unauthorized_message(update)
+        return
+
+    tracker = _get_activity_tracker(context)
+    if tracker is None or not tracker.enabled:
+        await update.effective_message.reply_text(
+            "⏱ Учёт активности отключён. Включите ACTIVITY_ENABLED=1 в .env и перезапустите бота."
+        )
+        return
+
+    args = context.args or []
+    if args and args[0].lower() in ("все", "all", "файл", "file"):
+        text = tracker.build_log_plain()
+        buffer = BytesIO(text.encode("utf-8"))
+        buffer.seek(0)
+        await update.effective_message.reply_document(
+            document=buffer,
+            filename=f"controlbot-log-{date.today().isoformat()}.txt",
+            caption="📜 Полный журнал активности",
+            read_timeout=120,
+            write_timeout=120,
+        )
+        return
+
+    day: str | None = args[0] if args else None
+    if day:
+        low = day.lower()
+        if low in ("сегодня", "today"):
+            day = None
+        elif low in ("вчера", "yesterday"):
+            day = (date.today() - timedelta(days=1)).isoformat()
+        else:
+            try:
+                date.fromisoformat(day)
+            except ValueError:
+                await update.effective_message.reply_text(
+                    "Формат: /log 2026-11-03 · /log вчера · /log все"
+                )
+                return
+
+    text = tracker.build_log_text(day)
+    for chunk in _split_text(text):
+        await update.effective_message.reply_text(chunk, parse_mode="HTML")
+
+
 def build_application(config: BotConfig) -> Application:
     application = (
         ApplicationBuilder()
@@ -3802,6 +3872,7 @@ def build_application(config: BotConfig) -> Application:
     application.add_handler(CommandHandler("processes_all", processes_all_command))
     application.add_handler(CommandHandler("kill", kill_process_command))
     application.add_handler(CommandHandler("network", network_command))
+    application.add_handler(CommandHandler("log", log_command))
     application.add_handler(CommandHandler(["notify", "alerts"], notify_command))
     application.add_handler(CallbackQueryHandler(notify_callback, pattern=r"^notify:"))
     application.add_handler(CommandHandler(["term", "terminal"], term_command))

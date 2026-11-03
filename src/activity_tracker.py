@@ -768,3 +768,96 @@ class ActivityTracker:
         if self.browser_sites:
             text += "\n\n" + self.build_sites_text(days=1)
         return _fit_message(text)
+
+    # ------------------------------------------------------------------
+    # Журнал: когда и что было открыто
+    # ------------------------------------------------------------------
+
+    def sessions_for_day(self, day_key: str) -> list[dict[str, Any]]:
+        """Сессии за день, обрезанные по его границам."""
+        day = date.fromisoformat(day_key)
+        start_ts = time.mktime(day.timetuple())
+        end_ts = start_ts + 86400
+        rows: list[dict[str, Any]] = []
+
+        for rec in self._state.get("log", []):
+            try:
+                start = float(rec.get("start") or 0)
+                duration = float(rec.get("dur") or 0)
+            except (TypeError, ValueError):
+                continue
+            end = start + duration
+            if end <= start_ts or start >= end_ts:
+                continue
+            rows.append(
+                {
+                    "start": max(start, start_ts),
+                    "end": min(end, end_ts),
+                    "app": str(rec.get("app") or ""),
+                    "title": str(rec.get("title") or ""),
+                }
+            )
+
+        open_ses = self._state.get("open")
+        if isinstance(open_ses, dict):
+            try:
+                start = float(open_ses.get("start") or 0)
+            except (TypeError, ValueError):
+                start = 0.0
+            if start and start < end_ts:
+                rows.append(
+                    {
+                        "start": max(start, start_ts),
+                        "end": min(time.time(), end_ts),
+                        "app": str(open_ses.get("app") or ""),
+                        "title": str(open_ses.get("title") or ""),
+                    }
+                )
+
+        rows.sort(key=lambda row: row["start"])
+        return rows
+
+    def build_log_text(self, day_key: str | None = None, limit: int = 120) -> str:
+        """Журнал за день в виде «14:02:11–14:07:40  opera.exe — «…»  (5 мин)»."""
+        key = day_key or date.today().isoformat()
+        rows = self.sessions_for_day(key)
+        lines = [f"📜 <b>Журнал за {escape(key)}</b>", ""]
+
+        if not rows:
+            lines.append("За этот день записей нет.")
+            return "\n".join(lines)
+
+        for row in rows[:limit]:
+            left = time.strftime("%H:%M:%S", time.localtime(row["start"]))
+            right = time.strftime("%H:%M:%S", time.localtime(row["end"]))
+            title = _shorten(row["title"], 55)
+            title_part = f" — «{escape(title)}»" if title else ""
+            lines.append(
+                f"{left}–{right}  {escape(row['app'])}{title_part}"
+                f"  ({format_duration_short(row['end'] - row['start'])})"
+            )
+
+        if len(rows) > limit:
+            lines.append(f"… ещё {len(rows) - limit} записей (выгрузите файлом: /log все)")
+
+        return "\n".join(lines)
+
+    def build_log_plain(self, day_keys: list[str] | None = None) -> str:
+        """Полный журнал текстом для выгрузки файлом."""
+        keys = day_keys or sorted(self._state.get("days", {}).keys())
+        if not keys:
+            keys = [date.today().isoformat()]
+
+        out: list[str] = []
+        for key in keys:
+            out.append(f"=== {key} ===")
+            rows = self.sessions_for_day(key)
+            if not rows:
+                out.append("нет записей")
+            for row in rows:
+                left = time.strftime("%H:%M:%S", time.localtime(row["start"]))
+                right = time.strftime("%H:%M:%S", time.localtime(row["end"]))
+                out.append(f"{left}-{right}\t{row['app']}\t{row['title']}")
+            out.append("")
+        return "\n".join(out)
+
