@@ -25,6 +25,7 @@ from typing import Any
 
 from PIL import Image, ImageGrab
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -68,7 +69,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.13"
+APP_VERSION = "2026.11.14"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -3435,10 +3436,37 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def post_init(application: Application) -> None:
+    """Регистрируем команды в меню Telegram (кнопка «/»)."""
+    commands = [
+        ("start", "Меню и справка"),
+        ("status", "Состояние системы"),
+        ("access", "Кто имеет доступ к боту"),
+        ("grant", "Выдать доступ по ID"),
+        ("revoke", "Отозвать доступ"),
+        ("report", "Отправить отчёт Helper24"),
+        ("update", "Проверить обновление"),
+        ("screenshot", "Скриншот экрана"),
+        ("apps", "Что открыто сейчас"),
+        ("activity", "Сводка активности"),
+        ("processes", "Процессы"),
+        ("lock", "Заблокировать ПК"),
+        ("reboot", "Перезагрузить ПК"),
+    ]
+    try:
+        await application.bot.set_my_commands(
+            [BotCommand(name=name, description=desc) for name, desc in commands]
+        )
+        LOGGER.info("Меню команд обновлено: %s команд", len(commands))
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Не удалось обновить меню команд: %s", exc)
+
+
 def build_application(config: BotConfig) -> Application:
     application = (
         ApplicationBuilder()
         .token(config.token)
+        .post_init(post_init)
         .post_shutdown(save_activity_on_shutdown)
         .build()
     )
