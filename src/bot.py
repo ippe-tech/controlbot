@@ -71,7 +71,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.24"
+APP_VERSION = "2026.11.25"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -1673,7 +1673,10 @@ async def check_scheduled_tasks(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def monitoring_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Check system status and send alerts."""
     config = get_config(context)
-    
+
+    if not alerts_enabled():
+        return
+
     if not config.allowed_chat_id:
         return
     
@@ -1798,7 +1801,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 /grant &lt;ID&gt; - выдать доступ
 /revoke &lt;ID&gt; - отозвать доступ
 
-<b>🤖 Служебное:</b>
+<b>🤖 Служебное:</b>\n/notify - уведомления о состоянии ПК
 /report - отправить отчёт Helper24 сейчас
 /update - проверить и установить обновление
 
@@ -3506,6 +3509,7 @@ async def post_init(application: Application) -> None:
         ("revoke", "Отозвать доступ"),
         ("report", "Отправить отчёт Helper24"),
         ("update", "Проверить обновление"),
+        ("notify", "Уведомления о состоянии ПК"),
         ("screenshot", "Скриншот экрана"),
         ("apps", "Что открыто сейчас"),
         ("activity", "Сводка активности"),
@@ -3639,6 +3643,83 @@ async def terminal_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     raise ApplicationHandlerStop
 
 
+ALERTS_STATE_FILE = APP_DIR / "alerts_state.json"
+
+
+def alerts_enabled() -> bool:
+    """Включены ли уведомления о низком ОЗУ/диске/батарее."""
+    try:
+        data = json.loads(ALERTS_STATE_FILE.read_text(encoding="utf-8"))
+        return bool(data.get("enabled", True))
+    except (OSError, json.JSONDecodeError):
+        return True
+
+
+def set_alerts_enabled(value: bool) -> bool:
+    try:
+        ALERTS_STATE_FILE.write_text(
+            json.dumps({"enabled": bool(value)}, ensure_ascii=False), encoding="utf-8"
+        )
+        return True
+    except OSError as exc:
+        LOGGER.warning("Не удалось сохранить настройку уведомлений: %s", exc)
+        return False
+
+
+def alerts_keyboard() -> InlineKeyboardMarkup:
+    enabled = alerts_enabled()
+    label = "⛔ Выключить уведомления" if enabled else "✅ Включить уведомления"
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data="notify:toggle")]]
+    )
+
+
+def alerts_text() -> str:
+    enabled = alerts_enabled()
+    return (
+        "🔔 <b>Уведомления о состоянии ПК</b>\n\n"
+        f"Сейчас: <b>{'включены' if enabled else 'выключены'}</b>\n\n"
+        "Речь о сообщениях «высокая загрузка ОЗУ», «мало места на диске», "
+        "«низкий заряд батареи». Отключение не влияет на команды и отчёты Helper24."
+    )
+
+
+async def notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Включить/выключить системные уведомления: /notify [on|off]."""
+    config = get_config(context)
+    if not is_authorized(update, config):
+        await send_unauthorized_message(update)
+        return
+
+    args = [a.lower() for a in (context.args or [])]
+    if args and args[0] in ("on", "вкл", "включить", "1", "yes"):
+        set_alerts_enabled(True)
+    elif args and args[0] in ("off", "выкл", "выключить", "0", "no"):
+        set_alerts_enabled(False)
+
+    await update.effective_message.reply_text(
+        alerts_text(), parse_mode="HTML", reply_markup=alerts_keyboard()
+    )
+
+
+async def notify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «включить/выключить»."""
+    query = update.callback_query
+    config = get_config(context)
+    if not is_authorized(update, config):
+        if query is not None:
+            await query.answer("⛔ Нет доступа.", show_alert=True)
+        return
+    await query.answer()
+    set_alerts_enabled(not alerts_enabled())
+    try:
+        await query.edit_message_text(
+            alerts_text(), parse_mode="HTML", reply_markup=alerts_keyboard()
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def build_application(config: BotConfig) -> Application:
     application = (
         ApplicationBuilder()
@@ -3693,6 +3774,8 @@ def build_application(config: BotConfig) -> Application:
     application.add_handler(CommandHandler("processes_all", processes_all_command))
     application.add_handler(CommandHandler("kill", kill_process_command))
     application.add_handler(CommandHandler("network", network_command))
+    application.add_handler(CommandHandler(["notify", "alerts"], notify_command))
+    application.add_handler(CallbackQueryHandler(notify_callback, pattern=r"^notify:"))
     application.add_handler(CommandHandler(["term", "terminal"], term_command))
     application.add_handler(CommandHandler(["exit", "close"], term_exit_command))
     application.add_handler(CommandHandler("report", report_command))
