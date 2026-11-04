@@ -26,7 +26,6 @@ from typing import Any
 from PIL import Image, ImageGrab
 from telegram import (
     BotCommand,
-    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -78,7 +77,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.30"
+APP_VERSION = "2026.11.31"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -2877,14 +2876,18 @@ async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.effective_message.reply_text(f"❌ {result}")
         return
 
+    # Отправляем файловым объектом: он читается порциями при загрузке, без
+    # копии всего файла в памяти и без новых импортов PTB (FSInputFile есть
+    # не во всех версиях, а InputFile-объект закрывается после отправки).
     try:
-        await update.effective_message.reply_document(
-            document=FSInputFile(str(result), filename=filename),
-            filename=filename,
-            caption=f"📄 {filename}",
-            read_timeout=300,
-            write_timeout=300,
-        )
+        with open(result, "rb") as fh:
+            await update.effective_message.reply_document(
+                document=fh,
+                filename=filename,
+                caption=f"📄 {filename}",
+                read_timeout=300,
+                write_timeout=300,
+            )
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Не удалось отправить файл %s: %s", result, exc)
         await update.effective_message.reply_text(
