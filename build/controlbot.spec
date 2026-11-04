@@ -32,6 +32,8 @@ hidden = list(telegram_hidden) + [
     "tkinter",
     "tkinter.ttk",
     "tkinter.messagebox",
+    "cv2",
+    "numpy",
 ]
 
 a = Analysis(
@@ -42,7 +44,7 @@ a = Analysis(
     hiddenimports=hidden,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["matplotlib", "numpy", "cv2", "scipy", "pandas"],
+    excludes=["matplotlib", "scipy", "pandas"],
     noarchive=False,
 )
 

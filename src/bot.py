@@ -26,6 +26,7 @@ from typing import Any
 from PIL import Image, ImageGrab
 from telegram import (
     BotCommand,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -77,7 +78,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.29"
+APP_VERSION = "2026.11.30"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -1576,15 +1577,16 @@ def list_directory(path: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def get_file(path: str) -> tuple[bool, BytesIO | str, str | None]:
-    """Get file for sending."""
+def get_file(path: str) -> tuple[bool, Path | str, str | None]:
+    """Проверить файл и вернуть путь для потоковой отправки (без чтения в память)."""
     try:
-        p = Path(path).expanduser().resolve()
+        raw = (path or "").strip().strip('"').strip("'")
+        p = Path(raw).expanduser().resolve()
         if not p.exists():
-            return False, f"Файл не существует: {path}", None
+            return False, f"Файл не существует: {raw}", None
         if not p.is_file():
-            return False, f"Это не файл: {path}", None
-        
+            return False, f"Это не файл: {raw}", None
+
         # Check file size (Telegram limit is 50MB for bots)
         size_bytes = p.stat().st_size
         if size_bytes == 0:
@@ -1593,11 +1595,12 @@ def get_file(path: str) -> tuple[bool, BytesIO | str, str | None]:
         size_mb = size_bytes / (1024**2)
         if size_mb > 50:
             return False, f"Файл слишком большой ({size_mb:.1f} МБ). Лимит Telegram для ботов: 50 МБ.", None
-        
-        buffer = BytesIO(p.read_bytes())
-        buffer.seek(0)
-        return True, buffer, p.name
-        
+
+        if not os.access(p, os.R_OK):
+            return False, f"Нет прав на чтение: {p}", None
+
+        return True, p, p.name
+
     except Exception as e:
         return False, str(e), None
 
@@ -1767,7 +1770,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 <b>📷 Захват:</b>
 /screenshot - сделать скриншот
-/webcam - фото с веб-камеры
+/webcam - фото с веб-камеры (/webcam on — включить, /webcam off — выключить)
 
 <b>⏯ Мультимедиа:</b>
 /play - пуск/пауза
@@ -2649,26 +2652,88 @@ async def screenshot_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 
+WEBCAM_STATE_FILE = APP_DIR / "webcam_state.json"
+
+
+def webcam_enabled(config: BotConfig) -> bool:
+    """Веб-камера включена? Файл-переключатель важнее значения из .env."""
+    try:
+        data = json.loads(WEBCAM_STATE_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "enabled" in data:
+            return bool(data["enabled"])
+    except (OSError, json.JSONDecodeError):
+        pass
+    return bool(config.allow_webcam)
+
+
+def set_webcam_enabled(value: bool) -> bool:
+    try:
+        WEBCAM_STATE_FILE.write_text(
+            json.dumps({"enabled": bool(value)}, ensure_ascii=False), encoding="utf-8"
+        )
+        return True
+    except OSError as exc:
+        LOGGER.warning("Не удалось сохранить настройку веб-камеры: %s", exc)
+        return False
+
+
+def is_owner(update: Update, config: BotConfig) -> bool:
+    """Владелец бота — первый chat_id из ALLOWED_CHAT_IDS."""
+    chat = update.effective_chat
+    return bool(chat and config.allowed_chat_id and chat.id == config.allowed_chat_id)
+
+
 async def webcam_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config = get_config(context)
     if not is_authorized(update, config):
         await send_unauthorized_message(update)
         return
 
-    if not config.allow_webcam:
+    args = [a.lower() for a in (context.args or [])]
+    if args and args[0] in ("on", "вкл", "включить", "1", "да"):
+        if not is_owner(update, config):
+            await update.effective_message.reply_text(
+                "⛔ Включать веб-камеру может только владелец бота."
+            )
+            return
+        if set_webcam_enabled(True):
+            await update.effective_message.reply_text(
+                "📹 Веб-камера включена для этого ПК.\n"
+                "Снимок: /webcam · выключить: /webcam off"
+            )
+        else:
+            await update.effective_message.reply_text(
+                "❌ Не удалось сохранить настройку — проверьте права на папку бота."
+            )
+        return
+
+    if args and args[0] in ("off", "выкл", "выключить", "0", "нет"):
+        if not is_owner(update, config):
+            await update.effective_message.reply_text(
+                "⛔ Выключать веб-камеру может только владелец бота."
+            )
+            return
+        set_webcam_enabled(False)
+        await update.effective_message.reply_text("📹 Веб-камера выключена на этом ПК.")
+        return
+
+    if not webcam_enabled(config):
         await update.effective_message.reply_text(
-            "📹 Веб-камера отключена на этом ПК (ALLOW_WEBCAM=0)."
+            "📹 Веб-камера отключена на этом ПК (ALLOW_WEBCAM=0).\n"
+            "Включить: /webcam on (только владелец бота)."
         )
         return
 
     status = await update.effective_message.reply_text("📹 Получаю доступ к веб-камере...")
-    
-    success, result = take_webcam_photo()
+
+    success, result = await asyncio.to_thread(take_webcam_photo)
     if success:
         await status.delete()
         await update.effective_message.reply_photo(
             photo=result,
             caption="📹 Фото с веб-камеры готово.",
+            read_timeout=300,
+            write_timeout=300,
         )
     else:
         await status.edit_text(f"❌ {result}")
@@ -2803,16 +2868,28 @@ async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     path = " ".join(context.args)
-    success, result, filename = get_file(path)
-    
-    if success:
+    # Проверка файла и чтение с диска — в отдельном потоке, чтобы не блокировать
+    # цикл событий: иначе тяжёлый /get задерживает плановые задачи, в том числе
+    # проверку обновлений (job update_start пропускается и обновление "падает").
+    success, result, filename = await asyncio.to_thread(get_file, path)
+
+    if not success:
+        await update.effective_message.reply_text(f"❌ {result}")
+        return
+
+    try:
         await update.effective_message.reply_document(
-            document=result,
+            document=FSInputFile(str(result), filename=filename),
             filename=filename,
             caption=f"📄 {filename}",
+            read_timeout=300,
+            write_timeout=300,
         )
-    else:
-        await update.effective_message.reply_text(f"❌ {result}")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Не удалось отправить файл %s: %s", result, exc)
+        await update.effective_message.reply_text(
+            f"❌ Не удалось отправить файл: {type(exc).__name__}."
+        )
 
 
 async def open_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4040,26 +4117,47 @@ def build_application(config: BotConfig) -> Application:
 LOCK_FILE = APP_DIR / "controlbot_instance.lock"
 
 
-def acquire_instance_lock() -> bool:
-    """Не даёт запустить вторую копию бота на том же ПК (ошибка 409)."""
-    if LOCK_FILE.exists():
+def _lock_pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    if HAS_PSUTIL:
+        return psutil.pid_exists(pid)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_instance_lock(wait_seconds: float = 30.0) -> bool:
+    """Не даёт запустить вторую копию бота на том же ПК (ошибка 409).
+
+    После обновления новый exe стартует раньше, чем старый успевает выйти,
+    поэтому ждём освобождения lock-файла до 30 секунд: иначе свежая версия
+    сразу завершается и обновление "падает".
+    """
+    deadline = time.time() + max(0.0, float(wait_seconds))
+    while LOCK_FILE.exists():
         try:
             pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             pid = 0
 
-        alive = False
-        if pid:
-            if HAS_PSUTIL:
-                alive = psutil.pid_exists(pid)
-            else:
-                try:
-                    os.kill(pid, 0)
-                    alive = True
-                except OSError:
-                    alive = False
+        if not _lock_pid_alive(pid) or pid == os.getpid():
+            break
 
-        if alive and pid != os.getpid():
+        if time.time() >= deadline:
+            LOGGER.error("ControlBot уже запущен (PID %s). Вторая копия не нужна.", pid)
+            return False
+
+        time.sleep(0.5)
+
+    if LOCK_FILE.exists():
+        try:
+            pid = int(LOCK_FILE.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = 0
+        if _lock_pid_alive(pid) and pid != os.getpid():
             LOGGER.error("ControlBot уже запущен (PID %s). Вторая копия не нужна.", pid)
             return False
 
