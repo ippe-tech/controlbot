@@ -17,9 +17,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -153,9 +154,9 @@ def format_duration_short(seconds: float) -> str:
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     if hours:
-        return f"{hours} ч {minutes} мин"
+        return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
     if minutes:
-        return f"{minutes} мин {secs} сек"
+        return f"{minutes} мин" if secs == 0 else f"{minutes} мин {secs} сек"
     return f"{secs} сек"
 
 
@@ -182,6 +183,162 @@ def _fit_message(text: str, limit: int = 3900) -> str:
 
 
 # =============================================================================
+# ПЕРИОДЫ СУТОК И ВЫБОРКА ПО ВРЕМЕНИ
+# =============================================================================
+
+# Ночь принадлежит дню, в который она ЗАКАНЧИВАЕТСЯ:
+# «ночь с 29.10 по 30.10» = 21:00 29.10 → 08:00 30.10, входит в отчёт за 30.10.
+PERIOD_ORDER = ("ночь", "утро", "день", "вечер")
+PERIODS: dict[str, dict[str, Any]] = {
+    "ночь": {"label": "Ночь", "emoji": "🌙", "start": 21, "end": 8},
+    "утро": {"label": "Утро", "emoji": "🌅", "start": 8, "end": 12},
+    "день": {"label": "День", "emoji": "☀️", "start": 12, "end": 18},
+    "вечер": {"label": "Вечер", "emoji": "🌆", "start": 18, "end": 21},
+}
+
+_PERIOD_ALIASES = {
+    "ночь": "ночь", "night": "ночь",
+    "утро": "утро", "morning": "утро",
+    "день": "день", "day": "день",
+    "вечер": "вечер", "evening": "вечер",
+}
+
+_DATE_ALIASES = {"сегодня": 0, "today": 0, "вчера": 1, "yesterday": 1}
+
+_BROWSER_TAIL_RE = re.compile(
+    r"\s*[-–—]\s*(?:Google\s*Chrome|Chrome|Mozilla\s*Firefox|Firefox|"
+    r"Microsoft\s*Edge|Edge|Яндекс(?:\.Браузер)?|Opera|Brave|Vivaldi|Safari)\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_period(raw: str | None) -> str | None:
+    """«Ночь»/«night»/… → ключ периода; иначе None."""
+    return _PERIOD_ALIASES.get((raw or "").strip().lower())
+
+
+def normalize_date_arg(raw: str | None) -> str | None:
+    """«сегодня»/«вчера»/«ГГГГ-ММ-ДД» → ключ дня; иначе None."""
+    value = (raw or "").strip().lower()
+    if not value:
+        return date.today().isoformat()
+    if value in _DATE_ALIASES:
+        return (date.today() - timedelta(days=_DATE_ALIASES[value])).isoformat()
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return parsed.date().isoformat()
+
+
+def period_window(day_key: str, period: str) -> tuple[float, float]:
+    """Локальные границы периода (epoch).
+
+    Для ночи — с 21:00 предыдущего дня до 08:00 текущего.
+    """
+    day = date.fromisoformat(day_key)
+    spec = PERIODS[period]
+    start_hour, end_hour = spec["start"], spec["end"]
+    if start_hour > end_hour:
+        start = datetime.combine(day - timedelta(days=1), dt_time(start_hour, 0))
+        end = datetime.combine(day, dt_time(end_hour, 0))
+    else:
+        start = datetime.combine(day, dt_time(start_hour, 0))
+        end = datetime.combine(day, dt_time(end_hour, 0))
+    return start.timestamp(), end.timestamp()
+
+
+def period_header(day_key: str, period: str, html: bool = True) -> str:
+    """Заголовок в формате: «Ночь с 29.10.2026 по 30.10.2026 с 21:00 по 8:00»."""
+    day = date.fromisoformat(day_key)
+    spec = PERIODS[period]
+    start_hour, end_hour = spec["start"], spec["end"]
+    if start_hour > end_hour:
+        prev = day - timedelta(days=1)
+        head = (
+            f"{spec['emoji']} {spec['label']} с {prev.strftime('%d.%m.%Y')} "
+            f"по {day.strftime('%d.%m.%Y')} с {start_hour}:00 по {end_hour}:00"
+        )
+    else:
+        head = (
+            f"{spec['emoji']} {spec['label']} {day.strftime('%d.%m.%Y')} "
+            f"с {start_hour}:00 по {end_hour}:00"
+        )
+    return f"<b>{head}</b>" if html else head
+
+
+def parse_time_window(date_key: str, raw: str) -> tuple[float, float, str] | None:
+    """«ночь» или «21:00-23:30» → (start_ts, end_ts, подпись) или None."""
+    period = normalize_period(raw)
+    if period is not None:
+        start_ts, end_ts = period_window(date_key, period)
+        return start_ts, end_ts, period_header(date_key, period, html=False)
+
+    match = re.match(
+        r"^(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})$",
+        (raw or "").strip(),
+    )
+    if not match:
+        return None
+    start_h, start_m, end_h, end_m = (int(group) for group in match.groups())
+    if start_h > 23 or end_h > 23 or start_m > 59 or end_m > 59:
+        return None
+
+    day = date.fromisoformat(date_key)
+    start = datetime.combine(day, dt_time(start_h, start_m))
+    end = datetime.combine(day, dt_time(end_h, end_m))
+    if end <= start:
+        end += timedelta(days=1)  # диапазон через полночь
+    if end.date() == day:
+        label = f"{day.strftime('%d.%m.%Y')} с {start_h}:{start_m:02d} по {end_h}:{end_m:02d}"
+    else:
+        label = (
+            f"с {day.strftime('%d.%m.%Y')} {start_h}:{start_m:02d} "
+            f"по {end.strftime('%d.%m.%Y')} {end_h}:{end_m:02d}"
+        )
+    return start.timestamp(), end.timestamp(), label
+
+
+def _display_title(title: str) -> str:
+    """Убирает хвост браузера («— Google Chrome» и т.п.) — остаётся сайт/страница."""
+    text = (title or "").strip()
+    original = text
+    while True:
+        stripped = _BROWSER_TAIL_RE.sub("", text).strip()
+        if stripped == text or not stripped:
+            break
+        text = stripped
+    return text or original
+
+
+def _hm(ts: float) -> str:
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def split_message(text: str, limit: int = 3800) -> list[str]:
+    """Режет длинный текст на части по строкам (теги HTML не разрываются)."""
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
+            if current:
+                parts.append(current)
+                current = ""
+            while len(line) > limit:  # одна гигантская строка — режем жёстко
+                parts.append(line[:limit])
+                line = line[limit:]
+            current = line
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts
+
+
+# =============================================================================
 # TRACKER
 # =============================================================================
 
@@ -193,11 +350,14 @@ class ActivityTracker:
         data_path: Path | str,
         afk_threshold_seconds: int = 300,
         track_titles: bool = True,
-        retention_days: int = 30,
+        retention_days: int = 3,
         save_interval_seconds: int = 120,
         enabled: bool = True,
         title_limit: int = 120,
         titles_per_app_limit: int = 50,
+        min_session_seconds: int = 10,
+        log_gap_threshold_seconds: int = 900,
+        max_log_records: int = 30000,
         browser_sites: bool = True,
         browser_sites_interval: int = 60,
     ) -> None:
@@ -209,14 +369,19 @@ class ActivityTracker:
         self.enabled = bool(enabled)
         self._title_limit = title_limit
         self._titles_per_app_limit = titles_per_app_limit
+        self._min_session_seconds = max(0, int(min_session_seconds))
+        self._log_gap_threshold = max(0, int(log_gap_threshold_seconds))
+        self._max_log_records = max(1000, int(max_log_records))
         self.browser_sites = bool(browser_sites)
         self.browser_sites_interval = max(30, int(browser_sites_interval))
 
         self._state: dict[str, Any] = {
-            "version": 1,
+            "version": 2,
             "last_summary_date": "",
             "browser_seen": {},
             "days": {},
+            "log": [],
+            "open": None,
         }
         self._last_tick: float | None = None
         self._last_save: float = 0.0
@@ -239,13 +404,16 @@ class ActivityTracker:
             raw = json.loads(self.data_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 days = raw.get("days")
+                log = raw.get("log")
+                open_ses = raw.get("open")
+                browser_seen = raw.get("browser_seen")
                 self._state = {
                     "version": raw.get("version", 1),
                     "last_summary_date": str(raw.get("last_summary_date", "") or ""),
-                    "browser_seen": raw.get("browser_seen")
-                    if isinstance(raw.get("browser_seen"), dict)
-                    else {},
+                    "browser_seen": browser_seen if isinstance(browser_seen, dict) else {},
                     "days": days if isinstance(days, dict) else {},
+                    "log": log if isinstance(log, list) else [],
+                    "open": open_ses if isinstance(open_ses, dict) else None,
                 }
         except (OSError, json.JSONDecodeError) as exc:
             backup = self.data_path.with_suffix(".corrupt.json")
@@ -254,6 +422,18 @@ class ActivityTracker:
                 os.replace(self.data_path, backup)
             except OSError:
                 pass
+            return
+
+        # Незакрытая сессия с прошлого запуска: если файл давно не сохранялся
+        # (ПК был выключен), закрываем её по времени последнего сохранения —
+        # иначе простой попал бы в длительность сессии.
+        open_ses = self._state.get("open")
+        if open_ses:
+            try:
+                mtime = self.data_path.stat().st_mtime
+            except OSError:
+                mtime = time.time()
+            self._close_session(min(time.time(), mtime))
 
     def _save_sync(self) -> None:
         self._prune_state()
@@ -288,6 +468,22 @@ class ActivityTracker:
                 if titles and len(titles) > 30:
                     top = sorted(titles.items(), key=lambda kv: kv[1], reverse=True)
                     site["titles"] = dict(top[:30])
+
+        # Журнал сессий хранится ту же глубину, что и дни.
+        cutoff_ts = datetime.combine(
+            date.today() - timedelta(days=self.retention_days - 1), dt_time.min
+        ).timestamp()
+        log = self._state.get("log")
+        if log:
+            self._state["log"] = [
+                rec for rec in log if float(rec.get("start", 0.0) or 0.0) >= cutoff_ts
+            ]
+            if len(self._state["log"]) > self._max_log_records:
+                self._state["log"] = self._state["log"][-self._max_log_records :]
+
+        open_ses = self._state.get("open")
+        if open_ses and float(open_ses.get("start", 0.0) or 0.0) < cutoff_ts:
+            self._state["open"] = None
 
     # ------------------------------------------------------------------
     # Internal bookkeeping
@@ -421,6 +617,9 @@ class ActivityTracker:
             # Долгая пауза (сон/гибернация/остановка бота) — не приписываем
             # это время приложениям, но и не теряем: считаем АФК.
             self._day(self._today_key())["afk_seconds"] += delta
+            # Сессия, открытая до паузы, прекратилась не позднее последнего тика.
+            self._close_session(last)
+            self._state["open"] = None
             return
 
         pid, title = get_foreground_window()
@@ -468,6 +667,23 @@ class ActivityTracker:
 
         if not afk and exe:
             self._current_active += delta
+
+        # --- Журнал сессий: когда и что было открыто --------------------
+        session_title = ""
+        if self.track_titles and title:
+            session_title = _shorten(title, self._title_limit)
+        focus = (exe, session_title) if (exe and not afk) else None
+
+        open_ses = self._state.get("open")
+        open_key = (open_ses.get("app"), open_ses.get("title")) if open_ses else None
+        if focus != open_key:
+            self._close_session(now)
+            if focus is not None:
+                self._state["open"] = {
+                    "app": exe,
+                    "title": session_title,
+                    "start": now,
+                }
 
     # ------------------------------------------------------------------
     # Live snapshot
@@ -710,6 +926,201 @@ class ActivityTracker:
         return _fit_message("\n".join(lines))
 
     # ------------------------------------------------------------------
+    # Журнал сессий: что и когда было открыто
+    # ------------------------------------------------------------------
+
+    def _close_session(self, at_ts: float) -> None:
+        """Закрывает открытую сессию (фокус сменился, АФК, остановка)."""
+        open_ses = self._state.get("open")
+        if not open_ses:
+            return
+        start = float(open_ses.get("start", 0.0) or 0.0)
+        duration = at_ts - start
+        if self._min_session_seconds <= duration < 24 * 3600:
+            self._state.setdefault("log", []).append(
+                {
+                    "app": str(open_ses.get("app") or "unknown"),
+                    "title": str(open_ses.get("title") or ""),
+                    "start": start,
+                    "dur": round(duration, 1),
+                }
+            )
+        self._state["open"] = None
+
+    async def close_current_session(self) -> None:
+        """Корректно закрывает текущую сессию (вызывается при остановке бота)."""
+        self._close_session(time.time())
+
+    def stored_day_keys(self) -> list[str]:
+        """Дни, по которым есть данные (сегодня добавляется всегда)."""
+        keys = [
+            key
+            for key, day in self._state["days"].items()
+            if day.get("apps") or day.get("afk_seconds") or day.get("unknown_seconds")
+        ]
+        today = self._today_key()
+        if today not in keys:
+            keys.append(today)
+        return sorted(keys)
+
+    def _sessions_for_window(
+        self, start_ts: float, end_ts: float, now: float
+    ) -> list[dict[str, Any]]:
+        """Сессии, пересекающиеся с окном, обрезанные по его границам."""
+        raw: list[tuple[float, float, str, str, bool]] = []
+        for rec in self._state.get("log", []):
+            start = float(rec.get("start", 0.0) or 0.0)
+            end = start + float(rec.get("dur", 0.0) or 0.0)
+            if end <= start_ts or start >= end_ts:
+                continue
+            raw.append(
+                (start, end, str(rec.get("app", "")), str(rec.get("title", "")), False)
+            )
+
+        open_ses = self._state.get("open")
+        if open_ses:
+            start = float(open_ses.get("start", 0.0) or 0.0)
+            end = min(now, end_ts)
+            if start < end_ts and end > start_ts:
+                raw.append(
+                    (
+                        start,
+                        end,
+                        str(open_ses.get("app", "")),
+                        str(open_ses.get("title", "")),
+                        now < end_ts,
+                    )
+                )
+
+        raw.sort(key=lambda item: item[0])
+        rows: list[dict[str, Any]] = []
+        for start, end, app, title, ongoing in raw:
+            clipped_start = max(start, start_ts)
+            clipped_end = min(end, end_ts)
+            if clipped_end - clipped_start < 1.0:
+                continue
+            rows.append(
+                {
+                    "start": clipped_start,
+                    "end": clipped_end,
+                    "app": app,
+                    "title": title,
+                    "ongoing": ongoing,
+                }
+            )
+        return rows
+
+    def _build_log_blocks(
+        self, day_keys: list[str], period: str | None, html: bool, now: float
+    ) -> list[str]:
+        """Блоки журнала по периодам суток для перечисленных дней."""
+        blocks: list[str] = []
+        for day_key in day_keys:
+            for name in ([period] if period else PERIOD_ORDER):
+                start_ts, end_ts = period_window(day_key, name)
+                if start_ts > now and not period:
+                    continue  # период ещё не наступил — в общем журнале не показываем
+
+                lines = [period_header(day_key, name, html=html), ""]
+                rows = self._sessions_for_window(start_ts, end_ts, now)
+                if not rows:
+                    if start_ts > now:
+                        lines.append("— период ещё не наступил.")
+                    else:
+                        lines.append("— нет зафиксированной активности.")
+                else:
+                    last_end = start_ts
+                    for row in rows:
+                        gap = row["start"] - last_end
+                        if gap >= self._log_gap_threshold:
+                            lines.append(
+                                f"{_hm(last_end)}–{_hm(row['start'])} — 💤 нет активности"
+                                f" ({format_duration_short(gap)})"
+                            )
+                        app_text = escape(row["app"]) if html else row["app"]
+                        title_disp = _display_title(row["title"])
+                        if title_disp:
+                            title_disp = _shorten(title_disp, 64)
+                            if html:
+                                title_disp = escape(title_disp)
+                            title_part = f" — «{title_disp}»"
+                        else:
+                            title_part = ""
+                        suffix = " ⏳ ещё открыто" if row["ongoing"] else ""
+                        lines.append(
+                            f"{_hm(row['start'])}–{_hm(row['end'])} — {app_text}"
+                            f"{title_part}"
+                            f" ({format_duration_short(row['end'] - row['start'])})"
+                            f"{suffix}"
+                        )
+                        last_end = row["end"]
+
+                    tail_end = min(end_ts, now)
+                    if tail_end - last_end >= self._log_gap_threshold:
+                        lines.append(
+                            f"{_hm(last_end)}–{_hm(tail_end)} — 💤 нет активности"
+                            f" ({format_duration_short(tail_end - last_end)})"
+                        )
+                blocks.append("\n".join(lines))
+        return blocks
+
+    def build_log_text(self, date_key: str | None = None, period: str | None = None) -> str:
+        """Журнал за один день по периодам суток (HTML для Telegram)."""
+        if not self.enabled:
+            return "⏱ Учёт активности отключён."
+
+        key = date_key or self._today_key()
+        blocks = self._build_log_blocks([key], period, html=True, now=time.time())
+        if not blocks:
+            return "📜 За этот день данных пока нет."
+        return "\n\n".join(blocks)
+
+    def build_log_plain(self, day_keys: list[str] | None = None) -> str:
+        """Полный журнал в plain-text (для выгрузки файлом)."""
+        keys = day_keys or self.stored_day_keys()
+        blocks = self._build_log_blocks(keys, None, html=False, now=time.time())
+        if not blocks:
+            return "Журнал пуст."
+        return "📜 ЖУРНАЛ АКТИВНОСТИ — полный, по периодам суток\n\n" + "\n\n".join(blocks)
+
+    def build_window_summary_text(self, start_ts: float, end_ts: float, label: str) -> str:
+        """Сводка по произвольному интервалу времени (для /activity с выборкой)."""
+        if not self.enabled:
+            return "⏱ Учёт активности отключён."
+
+        rows = self._sessions_for_window(start_ts, end_ts, time.time())
+        lines = [f"⏱ <b>Активность — {escape(label)}</b>", ""]
+
+        if not rows:
+            lines.append("В этом интервале активность не зафиксирована.")
+            return _fit_message("\n".join(lines))
+
+        per_app: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            info = per_app.setdefault(row["app"], {"seconds": 0.0, "titles": {}})
+            spent = row["end"] - row["start"]
+            info["seconds"] += spent
+            if row["title"]:
+                info["titles"][row["title"]] = info["titles"].get(row["title"], 0.0) + spent
+
+        total = sum(info["seconds"] for info in per_app.values())
+        ranked = sorted(per_app.items(), key=lambda kv: kv[1]["seconds"], reverse=True)
+        lines.append(f"⏱ Активно в интервале: <b>{format_duration_short(total)}</b>")
+        lines.append(f"🖥 Приложений: {len(ranked)}")
+        lines.append("")
+        for index, (app, info) in enumerate(ranked[:12], 1):
+            lines.append(
+                f"{index}. <b>{escape(app)}</b> — {format_duration_short(info['seconds'])}"
+            )
+            top_titles = sorted(info["titles"].items(), key=lambda kv: kv[1], reverse=True)[:3]
+            for title, seconds in top_titles:
+                lines.append(
+                    f"   └ {escape(_shorten(_display_title(title), 60))}"
+                    f" — {format_duration_short(seconds)}"
+                )
+        return _fit_message("\n".join(lines))
+
+    # ------------------------------------------------------------------
     # Daily summary bookkeeping
     # ------------------------------------------------------------------
 
@@ -768,96 +1179,3 @@ class ActivityTracker:
         if self.browser_sites:
             text += "\n\n" + self.build_sites_text(days=1)
         return _fit_message(text)
-
-    # ------------------------------------------------------------------
-    # Журнал: когда и что было открыто
-    # ------------------------------------------------------------------
-
-    def sessions_for_day(self, day_key: str) -> list[dict[str, Any]]:
-        """Сессии за день, обрезанные по его границам."""
-        day = date.fromisoformat(day_key)
-        start_ts = time.mktime(day.timetuple())
-        end_ts = start_ts + 86400
-        rows: list[dict[str, Any]] = []
-
-        for rec in self._state.get("log", []):
-            try:
-                start = float(rec.get("start") or 0)
-                duration = float(rec.get("dur") or 0)
-            except (TypeError, ValueError):
-                continue
-            end = start + duration
-            if end <= start_ts or start >= end_ts:
-                continue
-            rows.append(
-                {
-                    "start": max(start, start_ts),
-                    "end": min(end, end_ts),
-                    "app": str(rec.get("app") or ""),
-                    "title": str(rec.get("title") or ""),
-                }
-            )
-
-        open_ses = self._state.get("open")
-        if isinstance(open_ses, dict):
-            try:
-                start = float(open_ses.get("start") or 0)
-            except (TypeError, ValueError):
-                start = 0.0
-            if start and start < end_ts:
-                rows.append(
-                    {
-                        "start": max(start, start_ts),
-                        "end": min(time.time(), end_ts),
-                        "app": str(open_ses.get("app") or ""),
-                        "title": str(open_ses.get("title") or ""),
-                    }
-                )
-
-        rows.sort(key=lambda row: row["start"])
-        return rows
-
-    def build_log_text(self, day_key: str | None = None, limit: int = 120) -> str:
-        """Журнал за день в виде «14:02:11–14:07:40  opera.exe — «…»  (5 мин)»."""
-        key = day_key or date.today().isoformat()
-        rows = self.sessions_for_day(key)
-        lines = [f"📜 <b>Журнал за {escape(key)}</b>", ""]
-
-        if not rows:
-            lines.append("За этот день записей нет.")
-            return "\n".join(lines)
-
-        for row in rows[:limit]:
-            left = time.strftime("%H:%M:%S", time.localtime(row["start"]))
-            right = time.strftime("%H:%M:%S", time.localtime(row["end"]))
-            title = _shorten(row["title"], 55)
-            title_part = f" — «{escape(title)}»" if title else ""
-            lines.append(
-                f"{left}–{right}  {escape(row['app'])}{title_part}"
-                f"  ({format_duration_short(row['end'] - row['start'])})"
-            )
-
-        if len(rows) > limit:
-            lines.append(f"… ещё {len(rows) - limit} записей (выгрузите файлом: /log все)")
-
-        return "\n".join(lines)
-
-    def build_log_plain(self, day_keys: list[str] | None = None) -> str:
-        """Полный журнал текстом для выгрузки файлом."""
-        keys = day_keys or sorted(self._state.get("days", {}).keys())
-        if not keys:
-            keys = [date.today().isoformat()]
-
-        out: list[str] = []
-        for key in keys:
-            out.append(f"=== {key} ===")
-            rows = self.sessions_for_day(key)
-            if not rows:
-                out.append("нет записей")
-            for row in rows:
-                left = time.strftime("%H:%M:%S", time.localtime(row["start"]))
-                right = time.strftime("%H:%M:%S", time.localtime(row["end"]))
-                out.append(f"{left}-{right}\t{row['app']}\t{row['title']}")
-            out.append("")
-        return "\n".join(out)
-

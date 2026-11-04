@@ -62,7 +62,13 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-from activity_tracker import ActivityTracker
+from activity_tracker import (
+    ActivityTracker,
+    normalize_date_arg,
+    normalize_period,
+    parse_time_window,
+    split_message,
+)
 import access_store
 import admin_panel
 
@@ -71,7 +77,7 @@ try:
 except ImportError:  # модуля нет рядом — отчёты просто отключатся
     helper24_report = None  # type: ignore[assignment]
 
-APP_VERSION = "2026.11.28"
+APP_VERSION = "2026.11.29"
 UPDATE_MANIFEST_URL = os.getenv(
     "UPDATE_MANIFEST_URL", "https://gym24server.online/controlbot/latest.json"
 )
@@ -3770,7 +3776,7 @@ def _split_text(text: str, limit: int = 3800) -> list[str]:
 
 
 async def log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Журнал активности: /log [дата|все]."""
+    """Полный журнал действий: когда и что открывалось, с названиями сайтов."""
     config = get_config(context)
     if not is_authorized(update, config):
         await send_unauthorized_message(update)
@@ -3784,37 +3790,39 @@ async def log_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     args = context.args or []
-    if args and args[0].lower() in ("все", "all", "файл", "file"):
-        text = tracker.build_log_plain()
-        buffer = BytesIO(text.encode("utf-8"))
-        buffer.seek(0)
-        await update.effective_message.reply_document(
-            document=buffer,
-            filename=f"controlbot-log-{date.today().isoformat()}.txt",
-            caption="📜 Полный журнал активности",
-            read_timeout=120,
-            write_timeout=120,
+
+    # /log все (| /log 3) — весь журнал за все хранимые дни; длинный — файлом
+    if args and args[0].lower() in {"все", "всё", "all", "3"}:
+        plain = tracker.build_log_plain()
+        if len(plain) <= 3500:
+            for chunk in split_message(plain):
+                await update.effective_message.reply_text(chunk)
+        else:
+            await update.effective_message.reply_document(
+                document=BytesIO(plain.encode("utf-8")),
+                filename=f"activity_log_{time.strftime('%Y-%m-%d_%H-%M')}.txt",
+                caption="📜 Полный журнал активности по периодам суток",
+            )
+        return
+
+    date_key = normalize_date_arg(args[0] if args else None)
+    if date_key is None:
+        await update.effective_message.reply_text(
+            "❌ Неверная дата. Используйте: сегодня | вчера | ГГГГ-ММ-ДД\n"
+            "Примеры: /log, /log вчера ночь, /log 2026-10-29, /log все"
         )
         return
 
-    day: str | None = args[0] if args else None
-    if day:
-        low = day.lower()
-        if low in ("сегодня", "today"):
-            day = None
-        elif low in ("вчера", "yesterday"):
-            day = (date.today() - timedelta(days=1)).isoformat()
-        else:
-            try:
-                date.fromisoformat(day)
-            except ValueError:
-                await update.effective_message.reply_text(
-                    "Формат: /log 2026-11-03 · /log вчера · /log все"
-                )
-                return
+    period = normalize_period(args[1]) if len(args) > 1 else None
+    if len(args) > 1 and period is None:
+        await update.effective_message.reply_text(
+            "❌ Не понял период. Варианты: ночь | утро | день | вечер\n"
+            "Пример: /log вчера ночь"
+        )
+        return
 
-    text = tracker.build_log_text(day)
-    for chunk in _split_text(text):
+    text = tracker.build_log_text(date_key, period)
+    for chunk in split_message(text):
         await update.effective_message.reply_text(chunk, parse_mode="HTML")
 
 
